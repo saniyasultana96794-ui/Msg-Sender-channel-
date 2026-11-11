@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
 Advanced Telegram Multi-Platform Channel Dispatcher Bot
-100% Stable Production Build | Thread-Safe SQLite & Bulletproof Auto-Forward
+100% Stable Production Build | Thread-Safe SQLite & Auto-Backup System
 Timezone: Asia/Kolkata (IST)
 """
 
 import asyncio
 import datetime
 import html
+import io
 import json
 import logging
 import os
@@ -193,7 +194,7 @@ def init_db():
 
         cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('is_paused', '0');")
 
-        # Cleanup any orphaned records from earlier versions
+        # Cleanup orphaned platform mappings
         cursor.execute("DELETE FROM platform_domains WHERE platform_id NOT IN (SELECT id FROM platforms);")
         cursor.execute("DELETE FROM platform_channels WHERE platform_id NOT IN (SELECT id FROM platforms);")
         cursor.execute("DELETE FROM schedules WHERE platform_id NOT IN (SELECT id FROM platforms);")
@@ -294,6 +295,7 @@ def build_main_menu() -> ReplyKeyboardMarkup:
         [KeyboardButton("📊 Statistics"), KeyboardButton("⏸️ Pause / Resume")],
         [KeyboardButton("🧭 Review Unknown"), KeyboardButton("🗑️ Remove Channel")],
         [KeyboardButton("🧹 Clear Queue"), KeyboardButton("❓ Help")],
+        [KeyboardButton("📦 Backup"), KeyboardButton("📥 Restore")],
     ]
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True, is_persistent=True)
 
@@ -319,6 +321,112 @@ async def safe_edit_text(query, text: str, reply_markup: InlineKeyboardMarkup = 
     except BadRequest as e:
         if "Message is not modified" not in str(e):
             logger.warning("safe_edit_text: %s", e)
+
+
+# ==============================================================================
+# BACKUP & RESTORE HELPERS
+# ==============================================================================
+def export_database_json() -> str:
+    """Exports all SQLite tables into a clean JSON string."""
+    data = {}
+    with get_db() as conn:
+        for table in ["channels", "platforms", "platform_domains", "platform_channels", "schedules", "queued_posts", "settings"]:
+            rows = conn.execute(f"SELECT * FROM {table};").fetchall()
+            data[table] = [dict(row) for row in rows]
+    return json.dumps(data, indent=2, ensure_ascii=False)
+
+
+def import_database_json(json_str: str) -> tuple[bool, str]:
+    """Restores database from JSON string inside an ACID transaction."""
+    try:
+        payload = json.loads(json_str)
+        with get_db() as conn:
+            cursor = conn.cursor()
+            # Clear existing data safely
+            for tbl in ["platform_channels", "platform_domains", "schedules", "queued_posts", "channels", "platforms", "settings"]:
+                cursor.execute(f"DELETE FROM {tbl};")
+
+            # Restore Channels
+            for row in payload.get("channels", []):
+                cursor.execute(
+                    "INSERT INTO channels (channel_id, title, username, can_post, created_at) VALUES (?, ?, ?, ?, ?);",
+                    (row["channel_id"], row["title"], row.get("username"), row.get("can_post", 1), row.get("created_at")),
+                )
+
+            # Restore Platforms
+            for row in payload.get("platforms", []):
+                cursor.execute(
+                    "INSERT INTO platforms (id, name, batch_limit, backup_link, header_text, footer_text, is_paused, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?);",
+                    (row["id"], row["name"], row.get("batch_limit", 5), row.get("backup_link"), row.get("header_text"), row.get("footer_text"), row.get("is_paused", 0), row.get("created_at")),
+                )
+
+            # Restore Domains
+            for row in payload.get("platform_domains", []):
+                cursor.execute(
+                    "INSERT INTO platform_domains (id, platform_id, domain, created_at) VALUES (?, ?, ?, ?);",
+                    (row["id"], row["platform_id"], row["domain"], row.get("created_at")),
+                )
+
+            # Restore Channel Assignments
+            for row in payload.get("platform_channels", []):
+                cursor.execute(
+                    "INSERT INTO platform_channels (platform_id, channel_id, created_at) VALUES (?, ?, ?);",
+                    (row["platform_id"], row["channel_id"], row.get("created_at")),
+                )
+
+            # Restore Schedules
+            for row in payload.get("schedules", []):
+                cursor.execute(
+                    "INSERT INTO schedules (id, platform_id, schedule_time, last_dispatched_date, created_at) VALUES (?, ?, ?, ?, ?);",
+                    (row["id"], row["platform_id"], row["schedule_time"], row.get("last_dispatched_date"), row.get("created_at")),
+                )
+
+            # Restore Queued Posts
+            for row in payload.get("queued_posts", []):
+                cursor.execute(
+                    "INSERT INTO queued_posts (id, platform_id, message_type, file_id, content_text, caption, entities_json, detected_urls, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
+                    (row["id"], row.get("platform_id"), row["message_type"], row.get("file_id"), row.get("content_text"), row.get("caption"), row.get("entities_json"), row.get("detected_urls"), row.get("status", "pending"), row.get("created_at")),
+                )
+
+            # Restore Settings
+            for row in payload.get("settings", []):
+                cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?);", (row["key"], row["value"]))
+
+            conn.commit()
+        return True, "All tables restored successfully!"
+    except Exception as e:
+        logger.exception("Restore error: %s", e)
+        return False, str(e)
+
+
+async def send_backup_file(bot, chat_id: int, caption_text: str):
+    """Generates and sends the backup JSON file."""
+    try:
+        backup_content = export_database_json()
+        timestamp = datetime.datetime.now(IST).strftime("%Y%m%d_%H%M%S")
+        filename = f"dispatcher_backup_{timestamp}.json"
+        file_bytes = io.BytesIO(backup_content.encode("utf-8"))
+        file_bytes.name = filename
+
+        await bot.send_document(
+            chat_id=chat_id,
+            document=file_bytes,
+            caption=caption_text,
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as e:
+        logger.error("Failed to send backup file: %s", e)
+
+
+async def auto_backup_job(context: ContextTypes.DEFAULT_TYPE):
+    """Automatically runs every 12 hours and dispatches backup to Owner."""
+    now_str = datetime.datetime.now(IST).strftime("%d-%m-%Y %I:%M %p")
+    caption = (
+        f"📦 <b>Scheduled Auto-Backup (12-Hour Cycle)</b>\n"
+        f"🕒 Time: <code>{now_str} IST</code>\n\n"
+        f"Kono karone bot redeploy korle ei file-ta diye <b>📥 Restore</b> kore nite parben."
+    )
+    await send_backup_file(context.bot, OWNER_ID, caption)
 
 
 # ==============================================================================
@@ -355,7 +463,6 @@ async def send_post_to_channel(bot, channel_id: int, post: sqlite3.Row, platform
     file_id = post["file_id"]
     final_caption = build_final_caption(platform, post["detected_urls"])
 
-    # Caption length guard for Telegram API limits
     if final_caption and len(final_caption) > 1024 and m_type != "text":
         final_caption = final_caption[:1020] + "..."
 
@@ -539,7 +646,7 @@ async def chat_member_updated_handler(update: Update, context: ContextTypes.DEFA
 
 
 # ==============================================================================
-# UNIVERSAL MESSAGE DISPATCHER & STATE MACHINE (Anti-Crash & Guaranteed Queue)
+# UNIVERSAL MESSAGE DISPATCHER & STATE MACHINE (Anti-Crash)
 # ==============================================================================
 async def universal_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
@@ -553,19 +660,25 @@ async def universal_message_handler(update: Update, context: ContextTypes.DEFAUL
     text = msg.text or ""
     current_state = context.user_data.get("state")
 
-    # Detect if message is forwarded from anywhere
-    is_forwarded = bool(
-        getattr(msg, "forward_origin", None)
-        or getattr(msg, "forward_date", None)
-        or getattr(msg, "forward_from", None)
-        or getattr(msg, "forward_from_chat", None)
-    )
+    # Safe Forward Detection
+    is_forwarded = False
+    try:
+        if (
+            getattr(msg, "forward_origin", None)
+            or getattr(msg, "forward_date", None)
+            or getattr(msg, "forward_from", None)
+            or getattr(msg, "forward_from_chat", None)
+        ):
+            is_forwarded = True
+    except Exception:
+        is_forwarded = False
 
     # 1. Handle Top-Level ReplyKeyboardMarkup Clicks
     if text in [
         "➕ Add Channel", "📢 Channels", "➕ Add Platform", "⚙️ Manage Platforms",
         "📥 Queues", "⏰ Schedules", "📊 Statistics", "⏸️ Pause / Resume",
-        "🧭 Review Unknown", "🗑️ Remove Channel", "🧹 Clear Queue", "❓ Help"
+        "🧭 Review Unknown", "🗑️ Remove Channel", "🧹 Clear Queue", "❓ Help",
+        "📦 Backup", "📥 Restore"
     ]:
         context.user_data.clear()
         if text == "➕ Add Channel":
@@ -592,9 +705,46 @@ async def universal_message_handler(update: Update, context: ContextTypes.DEFAUL
             await clear_queue_prompt(update, context)
         elif text == "❓ Help":
             await help_handler(update, context)
+        elif text == "📦 Backup":
+            await manual_backup_handler(update, context)
+        elif text == "📥 Restore":
+            await manual_restore_prompt(update, context)
         return
 
-    # 2. Handle Form Inputs ONLY IF NOT A FORWARDED POST
+    # 2. Handle Restore File Upload
+    if current_state == "AWAITING_RESTORE_FILE":
+        if text.strip().lower() == "/cancel":
+            context.user_data.clear()
+            await msg.reply_text("❌ Restore cancelled.", reply_markup=build_main_menu())
+            return
+
+        doc = msg.document
+        if not doc or not doc.file_name.endswith(".json"):
+            await msg.reply_text("⚠️ Please send or forward a valid <code>.json</code> backup file!\nCancel korte <code>/cancel</code> likhun.", parse_mode=ParseMode.HTML)
+            return
+
+        try:
+            tg_file = await doc.get_file()
+            file_bytes = await tg_file.download_as_bytearray()
+            json_str = file_bytes.decode("utf-8")
+            success, res_msg = import_database_json(json_str)
+
+            context.user_data.clear()
+            if success:
+                await msg.reply_text(
+                    "🎉 <b>Database Restored Successfully!</b>\n\n"
+                    "Sob platform, channels, domains, schedules ebong queues restore hoye geche.",
+                    reply_markup=build_main_menu(),
+                    parse_mode=ParseMode.HTML,
+                )
+            else:
+                await msg.reply_text(f"❌ Restore failed: <code>{html.escape(res_msg)}</code>", reply_markup=build_main_menu(), parse_mode=ParseMode.HTML)
+        except Exception as e:
+            logger.exception("Restore handling failed: %s", e)
+            await msg.reply_text(f"❌ Error parsing file: <code>{html.escape(str(e))}</code>", reply_markup=build_main_menu(), parse_mode=ParseMode.HTML)
+        return
+
+    # 3. Handle Form Inputs ONLY IF NOT A FORWARDED POST
     if current_state and not is_forwarded:
         if text.strip().lower() == "/cancel":
             context.user_data.clear()
@@ -703,7 +853,7 @@ async def universal_message_handler(update: Update, context: ContextTypes.DEFAUL
             await msg.reply_text(f"✅ Backup link set: {link or 'None'}", reply_markup=build_main_menu())
             return
 
-    # 3. If Forwarded or Standard Post -> Clear hanging state and process queue!
+    # 4. If Forwarded or Standard Post -> Clear hanging state and process queue!
     context.user_data.clear()
 
     m_type = "text"
@@ -734,11 +884,14 @@ async def universal_message_handler(update: Update, context: ContextTypes.DEFAUL
             if ent.url not in urls_found:
                 urls_found.append(ent.url)
         elif "url" in ent_type_str:
-            raw_u = full_content[ent.offset : ent.offset + ent.length].strip()
-            if raw_u and raw_u not in urls_found:
-                if not raw_u.startswith("http://") and not raw_u.startswith("https://"):
-                    raw_u = "https://" + raw_u
-                urls_found.append(raw_u)
+            try:
+                raw_u = full_content[ent.offset : ent.offset + ent.length].strip()
+                if raw_u and raw_u not in urls_found:
+                    if not raw_u.startswith("http://") and not raw_u.startswith("https://"):
+                        raw_u = "https://" + raw_u
+                    urls_found.append(raw_u)
+            except Exception:
+                continue
 
     matched_platform_id = None
     matched_platform_name = None
@@ -769,7 +922,6 @@ async def universal_message_handler(update: Update, context: ContextTypes.DEFAUL
             entities_json = serialize_entities(entities)
             saved_urls_list = matching_urls if matching_urls else urls_found
 
-            # Remove duplicate links maintaining order
             seen_u = set()
             unique_saved_urls = []
             for u in saved_urls_list:
@@ -788,13 +940,12 @@ async def universal_message_handler(update: Update, context: ContextTypes.DEFAUL
             )
             conn.commit()
 
-            # Information status for user
             if matched_platform_id:
                 assigned_count = conn.execute("SELECT COUNT(*) FROM platform_channels WHERE platform_id = ?;", (matched_platform_id,)).fetchone()[0]
                 schedule_count = conn.execute("SELECT COUNT(*) FROM schedules WHERE platform_id = ?;", (matched_platform_id,)).fetchone()[0]
 
                 timing_info = f"⏰ Scheduled ({schedule_count} ti time slot)" if schedule_count > 0 else "⚡ Continuous (Every 15s)"
-                chan_warning = "\n⚠️ <i>Warning: Ei platform-e ekhono kono channel assign kora nei! Manage Platforms theke channel add korun.</i>" if assigned_count == 0 else ""
+                chan_warning = "\n⚠️ <i>Warning: Ei platform-e ekhono kono channel assign kora nei!</i>" if assigned_count == 0 else ""
 
                 await msg.reply_text(
                     f"✅ <b>Post Queued for Platform:</b> <code>{html.escape(matched_platform_name)}</code>\n"
@@ -813,7 +964,7 @@ async def universal_message_handler(update: Update, context: ContextTypes.DEFAUL
                 )
     except Exception as e:
         logger.exception("Error during post queueing: %s", e)
-        await msg.reply_text(f"⚠️ Internal error while queueing post: <code>{html.escape(str(e))}</code>", parse_mode=ParseMode.HTML)
+        await msg.reply_text(f"⚠️ Error while processing post: <code>{html.escape(str(e))}</code>", parse_mode=ParseMode.HTML)
 
 
 # ==============================================================================
@@ -841,8 +992,29 @@ async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "2. <b>Add Platform:</b> Platform toiri korun ebong matching domain din.\n"
         "3. <b>Header & Footer:</b> Manage Platforms-e giye Platform Header ebong Footer set korun.\n"
         "4. <b>Schedules:</b> 24-hour chart theke 30 min ontor time select korun.\n"
-        "5. <b>Auto-Queue:</b> Direct forward kora post theke ager caption muche Header + Clean Link + Footer toiri hoye post hobe.",
+        "5. <b>Auto-Queue:</b> Direct forward kora post theke ager caption muche Header + Clean Link + Footer toiri hoye post hobe.\n"
+        "6. <b>Backup & Restore:</b> <code>📦 Backup</code> button tiple backup file paben ebong <code>📥 Restore</code> tiple file forward kore restore korte parben.",
         reply_markup=build_main_menu(),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def manual_backup_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    now_str = datetime.datetime.now(IST).strftime("%d-%m-%Y %I:%M %p")
+    caption = (
+        f"📦 <b>Manual Database Backup</b>\n"
+        f"🕒 Time: <code>{now_str} IST</code>\n\n"
+        f"Ei file-ta save kore rakhun. Redeploy korle <b>📥 Restore</b> click kore file forward korlei sob restore hoye jabe."
+    )
+    await send_backup_file(context.bot, update.effective_chat.id, caption)
+
+
+async def manual_restore_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["state"] = "AWAITING_RESTORE_FILE"
+    await update.effective_message.reply_text(
+        "📥 <b>Restore Database</b>\n\n"
+        "Apnar aage save kora <code>.json</code> backup file-ta ekhane pathan ba forward korun.\n\n"
+        "Cancel korte <code>/cancel</code> likhun.",
         parse_mode=ParseMode.HTML,
     )
 
@@ -1485,6 +1657,7 @@ def main():
     app.add_handler(ChatMemberHandler(chat_member_updated_handler, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_handler))
+    app.add_handler(CommandHandler("backup", manual_backup_handler))
 
     # All Inline Callback Handlers
     app.add_handler(CallbackQueryHandler(manage_platforms_handler, pattern=r"^pback_list$"))
@@ -1514,7 +1687,7 @@ def main():
     app.add_handler(CallbackQueryHandler(unknown_callback_handler, pattern=r"^uk_\w+"))
     app.add_handler(CallbackQueryHandler(close_dialog_callback, pattern=r"^close_dialog$"))
 
-    # Universal Handler: Guaranteed catching of forwarded posts & form actions
+    # Universal Handler: Guaranteed catching of forwarded posts & form actions & backup file uploads
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, universal_message_handler))
 
     app.add_error_handler(error_handler)
@@ -1522,7 +1695,10 @@ def main():
     # 15s Dispatcher task
     app.job_queue.run_repeating(dispatcher_job, interval=15, first=5)
 
-    logger.info("Bot starting with Bulletproof Queue Engine...")
+    # 12-Hour Automatic Backup Task (12 hours = 43200 seconds)
+    app.job_queue.run_repeating(auto_backup_job, interval=43200, first=43200)
+
+    logger.info("Bot starting with Anti-Crash & Auto-Backup system...")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 
